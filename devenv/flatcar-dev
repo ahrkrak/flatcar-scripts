@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+#
+# flatcar-dev - macOS-side driver for a Flatcar build environment.
+#
+# Why this exists:
+#   * The Flatcar SDK expects a case-sensitive filesystem. macOS APFS is
+#     case-insensitive by default, so the build tree cannot live on the Mac.
+#   * run_sdk_container bind-mounts "$PWD" into the SDK container, so the tree
+#     must sit on a path the Docker daemon can see directly.
+#
+# So the build tree lives in a Docker named volume (ext4, case-sensitive) and
+# all build commands run from a small "dev shell" control container that has
+# the Docker socket mounted and launches the SDK container as a sibling.
+#
+# The clone on the Mac (this repo) stays your editing/PR workspace.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+VOLUME="${FLATCAR_VOLUME:-flatcar-scripts-src}"
+CONTAINER="${FLATCAR_DEVSHELL:-flatcar-devshell}"
+IMAGE="${FLATCAR_DEVSHELL_IMAGE:-flatcar-devshell:latest}"
+FORK_URL="${FLATCAR_FORK_URL:-https://github.com/ahrkrak/flatcar-scripts.git}"
+UPSTREAM_URL="${FLATCAR_UPSTREAM_URL:-https://github.com/flatcar/scripts.git}"
+
+# Flatcar publishes SDK containers only for released versions, and only for
+# amd64. Pin to a tag that actually exists in ghcr.io/flatcar.
+SDK_VERSION="${FLATCAR_SDK_VERSION:-4790.0.0}"
+
+# Keep the OS (sourcetree) version aligned with the SDK by default. Left at the
+# nightly version derived from git, the SDK entrypoint tries to regenerate board
+# configs against a binhost that was never published, and the run aborts.
+OS_VERSION="${FLATCAR_OS_VERSION:-${SDK_VERSION}}"
+
+VOL_PATH="/var/lib/docker/volumes/${VOLUME}/_data"
+TREE="${VOL_PATH}/scripts"
+
+die() { echo "flatcar-dev: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+
+require_docker() {
+    docker info >/dev/null 2>&1 || die "Docker Desktop is not running."
+}
+
+ensure_volume() {
+    docker volume inspect "${VOLUME}" >/dev/null 2>&1 || {
+        info "Creating volume ${VOLUME}"
+        docker volume create "${VOLUME}" >/dev/null
+    }
+}
+
+ensure_tree() {
+    ensure_volume
+    if ! docker run --rm -v "${VOLUME}:/w" alpine:3 test -d /w/scripts/.git 2>/dev/null; then
+        info "Cloning ${FORK_URL} into volume ${VOLUME} (this takes a few minutes)"
+        docker run --rm --entrypoint sh -v "${VOLUME}:/w" alpine/git:latest -c "
+            set -e
+            git clone --quiet '${FORK_URL}' /w/scripts
+            cd /w/scripts
+            git remote add upstream '${UPSTREAM_URL}'
+            git remote set-url --push upstream DISABLED
+        "
+    fi
+}
+
+ensure_image() {
+    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1 || [[ ${1:-} == force ]]; then
+        info "Building dev shell image ${IMAGE}"
+        docker build -t "${IMAGE}" "${REPO_DIR}/devenv"
+    fi
+}
+
+ensure_up() {
+    require_docker
+    ensure_tree
+    ensure_image
+    local state
+    state="$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || true)"
+    case "${state}" in
+        running) return 0 ;;
+        "" ) ;;
+        *) info "Removing stale container ${CONTAINER} (${state})"
+           docker rm -f "${CONTAINER}" >/dev/null ;;
+    esac
+    info "Starting dev shell container ${CONTAINER}"
+    docker run -d --name "${CONTAINER}" \
+        --privileged \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "${VOL_PATH}:${VOL_PATH}" \
+        -v "${REPO_DIR}:/host/scripts:ro" \
+        -e "FLATCAR_TREE=${TREE}" \
+        "${IMAGE}" \
+        sleep infinity >/dev/null
+}
+
+in_shell() {
+    docker exec -i -w "${TREE}" \
+        -e "DOCKER_HOST=unix:///run/docker-sdk.sock" \
+        -e "FLATCAR_TREE=${TREE}" \
+        -u sdk \
+        "${CONTAINER}" "$@"
+}
+
+in_shell_tty() {
+    docker exec -it -w "${TREE}" \
+        -e "DOCKER_HOST=unix:///run/docker-sdk.sock" \
+        -e "FLATCAR_TREE=${TREE}" \
+        -u sdk \
+        "${CONTAINER}" "$@"
+}
+
+usage() {
+    cat <<'EOF'
+flatcar-dev - Flatcar build environment driver for macOS
+
+  up               Create/start the Linux dev shell container (idempotent).
+  shell            Interactive shell in the build tree (inside the VM).
+  sdk [args...]    Run ./run_sdk_container in the build tree.
+                   With no args: interactive SDK shell.
+                   Example: flatcar-dev sdk -t -- ./build_packages --board=amd64-usr
+  sync [ref]       Fetch the current (or given) branch from the Mac clone into
+                   the build tree and check it out as 'devwork'.
+  fetch-upstream   Fetch flatcar/scripts in both the Mac clone and build tree.
+  status           Show environment + git status on both sides.
+  rebuild-image    Rebuild the dev shell image.
+  down             Stop and remove the dev shell container (tree is preserved).
+  destroy          Remove the container AND the build tree volume. Destructive.
+
+Environment overrides:
+  FLATCAR_SDK_VERSION  SDK container tag to use (default: SDK_VERSION_DEFAULT)
+  FLATCAR_OS_VERSION   Sourcetree/OS version (default: same as SDK version)
+  FLATCAR_VOLUME       Docker volume holding the build tree
+EOF
+}
+
+cmd="${1:-help}"
+[[ $# -gt 0 ]] && shift || true
+
+case "${cmd}" in
+    up)
+        ensure_up
+        info "Ready. Tree: ${TREE}"
+        ;;
+
+    shell)
+        ensure_up
+        in_shell_tty bash -l
+        ;;
+
+    sdk)
+        ensure_up
+        if [[ $# -eq 0 ]]; then
+            info "Opening interactive SDK shell (SDK ${SDK_VERSION}, OS ${OS_VERSION})"
+            in_shell_tty ./run_sdk_container -t -V "${SDK_VERSION}" -v "${OS_VERSION}"
+        else
+            in_shell_tty ./run_sdk_container -t -V "${SDK_VERSION}" -v "${OS_VERSION}" "$@"
+        fi
+        ;;
+
+    sync)
+        ensure_up
+        ref="${1:-$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD)}"
+        info "Syncing '${ref}' from Mac clone into build tree as 'devwork'"
+        in_shell bash -lc "
+            set -e
+            git fetch --no-tags /host/scripts '${ref}'
+            git checkout -B devwork FETCH_HEAD
+            git --no-pager log --oneline -1
+        "
+        ;;
+
+    fetch-upstream)
+        info "Fetching upstream in Mac clone"
+        git -C "${REPO_DIR}" fetch upstream --tags
+        ensure_up
+        info "Fetching upstream in build tree"
+        in_shell bash -lc "git fetch upstream --tags && git --no-pager log --oneline -1 upstream/main"
+        ;;
+
+    status)
+        require_docker
+        echo "Mac clone:     ${REPO_DIR}"
+        git -C "${REPO_DIR}" --no-pager status -sb | head -5
+        echo
+        echo "Volume:        ${VOLUME} -> ${TREE}"
+        echo "SDK version:   ${SDK_VERSION} (OS ${OS_VERSION})"
+        echo "Dev shell:     $(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo 'not created')"
+        if docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null | grep -q running; then
+            echo
+            in_shell bash -lc 'git --no-pager status -sb | head -5; echo; df -h . | tail -1'
+        fi
+        ;;
+
+    rebuild-image)
+        require_docker
+        ensure_image force
+        docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+        ensure_up
+        ;;
+
+    down)
+        docker rm -f "${CONTAINER}" >/dev/null 2>&1 && info "Removed ${CONTAINER}" || info "Not running"
+        ;;
+
+    destroy)
+        read -r -p "This deletes the build tree volume '${VOLUME}'. Type 'yes' to confirm: " ans
+        [[ ${ans} == yes ]] || die "aborted"
+        docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+        docker volume rm "${VOLUME}" >/dev/null && info "Volume removed"
+        ;;
+
+    help|-h|--help)
+        usage | sed "s/SDK_VERSION_DEFAULT/${SDK_VERSION}/"
+        ;;
+
+    *)
+        die "unknown command '${cmd}' (try: flatcar-dev help)"
+        ;;
+esac
