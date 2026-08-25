@@ -117,12 +117,20 @@ cached probe to the x86_64 `_trace_possible()` hook: when the register file is
 unreadable, tracing is reported as impossible and libsandbox falls back to its
 existing "Unable to trace static ELF" path. `LD_PRELOAD` sandboxing is
 untouched, so only static binaries lose sandbox coverage instead of the build
-aborting. Expect paired QA notices per static exec — that is the fix working:
+aborting.
 
-```
-* ptrace(PTRACE_GETREGS) is not usable (Input/output error); disabling trace-based sandboxing
-* Unable to trace static ELF: /usr/bin/go: go env GOOS
-```
+Both the probe result and the resulting "Unable to trace static ELF" notice are
+logged via `sb_debug_dyn()` rather than as QA warnings, because the condition is
+a property of the environment and not something you can act on — left as
+warnings it produced two lines per static exec, which across a full
+`build_packages` is thousands of lines. **The degradation is therefore silent.**
+
+Be aware that `SANDBOX_DEBUG=1` does *not* usefully surface them: it floods
+portage's message pipe hard enough to abort the ebuild during `unpack`. That is
+pre-existing upstream behaviour, not something this patch introduced — it
+reproduces on packages that never execute a static ELF at all (verified with
+`app-arch/xz-utils`). Treat this section as the documentation of record for the
+fact that static binaries build unsandboxed on this host.
 
 That package is the only one in `coreos-overlay` shadowing `portage-stable`
 (which is an unmodified Gentoo mirror and must not be patched directly). When

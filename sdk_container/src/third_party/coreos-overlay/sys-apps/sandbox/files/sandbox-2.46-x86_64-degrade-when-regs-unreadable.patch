@@ -58,8 +58,13 @@ individual binary, there is nothing the user can act on, and it would other-
 wise emit two QA warnings for every static ELF executed -- which for a Go-heavy
 tree is essentially constant.  Add a trace_env_broken() hook (defaulting to
 false, overridden by the x86_64 code) so trace_possible() can log this case via
-sb_debug_dyn() instead of sb_eqawarn().  Both messages are therefore visible
-only with SANDBOX_DEBUG=1.
+sb_debug_dyn() instead of sb_eqawarn().
+
+Note that sb_debug_dyn() writes to portage's message pipe, and setting
+SANDBOX_DEBUG=1 for an emerge floods that pipe badly enough to abort the ebuild
+in its unpack phase.  That is pre-existing upstream behaviour, reproducible on
+packages that never execute a static ELF, so in practice these two messages are
+simply suppressed during builds rather than being redirected somewhere useful.
 
 Not accepted upstream (yet); reported downstream against Flatcar SDK builds on
 Apple Silicon.
