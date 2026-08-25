@@ -44,21 +44,57 @@ it looks like a working ptrace implementation).
 
 Extend the x86_64 _trace_possible() hook -- which already exists to describe
 what this architecture can and cannot trace -- with a one-off, cached probe
+Extend the x86_64 _trace_possible() hook -- which already exists to describe
+what this architecture can and cannot trace -- with a one-off, cached probe
 that verifies the register file is actually readable.  When it is not, tracing
 is reported as impossible and libsandbox falls back to the existing, well
-tested "unable to trace static ELF" path: a QA notice is emitted and the
-process runs untraced.  LD_PRELOAD-based sandboxing of dynamically linked
-binaries is unaffected, so only static binaries lose sandbox coverage instead
-of the entire build aborting.
+tested "unable to trace static ELF" path, so the process runs untraced.
+LD_PRELOAD-based sandboxing of dynamically linked binaries is unaffected,
+meaning only static binaries lose sandbox coverage instead of the entire build
+aborting.
+
+Because this condition is a property of the environment rather than of any
+individual binary, there is nothing the user can act on, and it would other-
+wise emit two QA warnings for every static ELF executed -- which for a Go-heavy
+tree is essentially constant.  Add a trace_env_broken() hook (defaulting to
+false, overridden by the x86_64 code) so trace_possible() can log this case via
+sb_debug_dyn() instead of sb_eqawarn().  Both messages are therefore visible
+only with SANDBOX_DEBUG=1.
 
 Not accepted upstream (yet); reported downstream against Flatcar SDK builds on
 Apple Silicon.
-
+diff --git a/libsandbox/trace.c b/libsandbox/trace.c
+index feaee65..baa3692 100644
+--- a/libsandbox/trace.c
++++ b/libsandbox/trace.c
+@@ -22,6 +22,10 @@ typedef int sb_ptrace_req_t;
+ static long _do_ptrace(sb_ptrace_req_t request, const char *srequest, void *addr, void *data);
+ #define do_ptrace(request, addr, data) _do_ptrace(request, #request, addr, data)
+ #define _trace_possible(data) true
++/* Arch code may override this to report that tracing is impossible because
++ * of the execution environment (e.g. an emulator that cannot expose the
++ * register file) rather than because of the binary being executed. */
++#define trace_env_broken() false
+ 
+ #ifdef DEBUG
+ # define SBDEBUG 1
+@@ -639,7 +643,10 @@ bool trace_possible(const char *filename, char *const argv[], const void *data)
+ 	}
+ 
+ 	char *args = flatten_args(argv);
+-	sb_eqawarn("Unable to trace static ELF: %s: %s\n", filename, args);
++	if (trace_env_broken())
++		sb_debug_dyn("Unable to trace static ELF: %s: %s\n", filename, args);
++	else
++		sb_eqawarn("Unable to trace static ELF: %s: %s\n", filename, args);
+ 	free(args);
+ 	return false;
+ }
 diff --git a/libsandbox/trace/linux/x86_64.c b/libsandbox/trace/linux/x86_64.c
-index d01e00f..748441c 100644
+index d01e00f..ec5597c 100644
 --- a/libsandbox/trace/linux/x86_64.c
 +++ b/libsandbox/trace/linux/x86_64.c
-@@ -1,6 +1,65 @@
+@@ -1,6 +1,72 @@
  #undef _trace_possible
  #define _trace_possible _trace_possible
  
@@ -106,9 +142,9 @@ index d01e00f..748441c 100644
 +		errno = 0;
 +		cached = ptrace(PTRACE_GETREGS, pid, NULL, &regs) != -1;
 +		if (!cached)
-+			sb_eqawarn("ptrace(PTRACE_GETREGS) is not usable (%s); "
-+			           "disabling trace-based sandboxing\n",
-+			           strerror(errno));
++			sb_debug_dyn("ptrace(PTRACE_GETREGS) is not usable (%s); "
++			             "disabling trace-based sandboxing\n",
++			             strerror(errno));
 +	} else
 +		/* The probe itself misbehaved; don't punish the build. */
 +		cached = true;
@@ -121,10 +157,17 @@ index d01e00f..748441c 100644
 +	return cached;
 +}
 +
++/* Tracing is being skipped because of the environment, not because of
++ * anything about the binary itself, so there is nothing the user can act
++ * on.  Let trace_possible() log it as debug rather than QA noise -- this
++ * fires on every static ELF, which for Go-heavy trees is constant. */
++#undef trace_env_broken
++#define trace_env_broken() (!trace_regs_readable())
++
  #ifdef SB_PERSONALITIES
  
  static const struct syscall_entry syscall_table_32[] = {
-@@ -59,6 +118,9 @@ static const struct syscall_entry *trace_check_personality(void *vregs)
+@@ -59,6 +125,9 @@ static const struct syscall_entry *trace_check_personality(void *vregs)
  
  static bool _trace_possible(const void *data)
  {
@@ -134,7 +177,7 @@ index d01e00f..748441c 100644
  	/* x86_64 can trace anything, but x32 can't trace x86_64 */
  #if defined(__x86_64__) && defined(__ILP32__)
  	const Elf64_Ehdr *ehdr = data;
-@@ -77,6 +139,9 @@ static bool pers_is_32(trace_regs *regs)
+@@ -77,6 +146,9 @@ static bool pers_is_32(trace_regs *regs)
  
  static bool _trace_possible(const void *data)
  {
