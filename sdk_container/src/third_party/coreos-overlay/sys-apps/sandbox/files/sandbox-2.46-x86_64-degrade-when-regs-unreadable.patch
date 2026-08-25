@@ -1,0 +1,146 @@
+Gracefully disable ptrace-based sandboxing when the x86_64 register file is
+not readable (e.g. under Apple Rosetta).
+
+Some environments emulate x86_64 without exposing the guest register file via
+ptrace().  Apple's Rosetta -- as used by Docker Desktop on Apple Silicon to run
+linux/amd64 containers -- lets PTRACE_TRACEME, PTRACE_SETOPTIONS and
+PTRACE_SYSCALL all succeed, but:
+
+  * PTRACE_GETREGS fails with EIO and leaves the caller's buffer untouched, and
+  * PTRACE_GETREGSET/NT_PRSTATUS succeeds but returns the *host's* native arm64
+    register set (x0-x30/sp/pc), which is meaningless when read through
+    struct user_regs_struct.
+
+libsandbox does not cope with this:
+
+  * _do_ptrace() deliberately swallows EIO (gentoo bug #560396), returning -1
+    without aborting, and
+  * trace_loop() assigns the result of trace_get_regs() to 'ret' but never
+    checks it.
+
+So trace_check_personality() inspects an uninitialized trace_regs, and
+pers_is_32() hits its default branch and kills the build with:
+
+    libsandbox/trace/linux/x86_64.c:pers_is_32():36: failure (Input/output error):
+    unknown x86_64 (CS) personality
+
+This triggers on the first static ELF that gets executed, which in practice
+means every Go binary, so any Go package fails to build while ordinary
+dynamically linked packages are unaffected.
+
+Note there is no register value that could be special-cased here: on the
+failing PTRACE_GETREGS path the register struct is never written at all, so
+regs->cs is whatever happened to be on the stack.
+
+trace_possible() already tries to detect environments where ptrace is unusable:
+
+    /* If we're in an environment like QEMU where ptrace doesn't work, then
+     * don't try to use it.  If ptrace does work, this should fail with ESRCH. */
+    ptrace(PTRACE_CONT, 0, NULL, NULL);
+    return errno == ENOSYS ? false : true;
+
+but that check only recognises ENOSYS, and Rosetta fails with ESRCH here (i.e.
+it looks like a working ptrace implementation).
+
+Extend the x86_64 _trace_possible() hook -- which already exists to describe
+what this architecture can and cannot trace -- with a one-off, cached probe
+that verifies the register file is actually readable.  When it is not, tracing
+is reported as impossible and libsandbox falls back to the existing, well
+tested "unable to trace static ELF" path: a QA notice is emitted and the
+process runs untraced.  LD_PRELOAD-based sandboxing of dynamically linked
+binaries is unaffected, so only static binaries lose sandbox coverage instead
+of the entire build aborting.
+
+Not accepted upstream (yet); reported downstream against Flatcar SDK builds on
+Apple Silicon.
+
+diff --git a/libsandbox/trace/linux/x86_64.c b/libsandbox/trace/linux/x86_64.c
+index d01e00f..748441c 100644
+--- a/libsandbox/trace/linux/x86_64.c
++++ b/libsandbox/trace/linux/x86_64.c
+@@ -1,6 +1,65 @@
+ #undef _trace_possible
+ #define _trace_possible _trace_possible
+ 
++/* Verify that we can actually read the tracee's x86_64 register file.
++ *
++ * Emulated environments such as Apple Rosetta let the ptrace() attach
++ * sequence succeed while being unable to expose x86_64 registers:
++ * PTRACE_GETREGS fails with EIO without writing to the supplied buffer.
++ * Since _do_ptrace() ignores EIO and trace_loop() does not check the
++ * return value of trace_get_regs(), the personality check would then run
++ * on uninitialized memory and abort the build.
++ *
++ * The result is cached: this is called from the exec path, but only for
++ * binaries we would otherwise trace, and the answer cannot change during
++ * the lifetime of the process.
++ */
++static bool trace_regs_readable(void)
++{
++	static int cached = -1;
++
++	struct sigaction old_sa, sa = { .sa_handler = SIG_DFL, };
++	trace_regs regs;
++	pid_t pid;
++	int status;
++
++	if (cached != -1)
++		return cached;
++
++	/* Make sure waitpid() below is not defeated by an inherited handler. */
++	sigaction(SIGCHLD, &sa, &old_sa);
++
++	pid = fork();
++	if (pid == -1) {
++		/* Can't tell right now; assume a sane environment and retry
++		 * on the next call rather than caching a guess. */
++		sigaction(SIGCHLD, &old_sa, NULL);
++		return true;
++	} else if (pid == 0) {
++		ptrace(PTRACE_TRACEME, 0, NULL, NULL);
++		kill(getpid(), SIGSTOP);
++		_exit(0);
++	}
++
++	if (waitpid(pid, &status, 0) == pid && WIFSTOPPED(status)) {
++		errno = 0;
++		cached = ptrace(PTRACE_GETREGS, pid, NULL, &regs) != -1;
++		if (!cached)
++			sb_eqawarn("ptrace(PTRACE_GETREGS) is not usable (%s); "
++			           "disabling trace-based sandboxing\n",
++			           strerror(errno));
++	} else
++		/* The probe itself misbehaved; don't punish the build. */
++		cached = true;
++
++	kill(pid, SIGKILL);
++	waitpid(pid, &status, 0);
++
++	sigaction(SIGCHLD, &old_sa, NULL);
++
++	return cached;
++}
++
+ #ifdef SB_PERSONALITIES
+ 
+ static const struct syscall_entry syscall_table_32[] = {
+@@ -59,6 +118,9 @@ static const struct syscall_entry *trace_check_personality(void *vregs)
+ 
+ static bool _trace_possible(const void *data)
+ {
++	if (!trace_regs_readable())
++		return false;
++
+ 	/* x86_64 can trace anything, but x32 can't trace x86_64 */
+ #if defined(__x86_64__) && defined(__ILP32__)
+ 	const Elf64_Ehdr *ehdr = data;
+@@ -77,6 +139,9 @@ static bool pers_is_32(trace_regs *regs)
+ 
+ static bool _trace_possible(const void *data)
+ {
++	if (!trace_regs_readable())
++		return false;
++
+ 	const Elf64_Ehdr *ehdr = data;
+ 	return (ehdr->e_ident[EI_CLASS] == ELFCLASS64) &&
+ 		(ehdr->e_machine == EM_X86_64);
