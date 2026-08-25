@@ -121,6 +121,9 @@ flatcar-dev - Flatcar build environment driver for macOS
                    Example: flatcar-dev sdk -t -- ./build_packages --board=amd64-usr
   sync [ref]       Fetch the current (or given) branch from the Mac clone into
                    the build tree and check it out as 'devwork'.
+  fix-sandbox      Rebuild sys-apps/sandbox in the SDK container from
+                   coreos-overlay, so it carries the Rosetta ptrace patch.
+                   Needed once per SDK container (see devenv/README.md).
   fetch-upstream   Fetch flatcar/scripts in both the Mac clone and build tree.
   status           Show environment + git status on both sides.
   rebuild-image    Rebuild the dev shell image.
@@ -168,6 +171,25 @@ case "${cmd}" in
             git checkout -B devwork FETCH_HEAD
             git --no-pager log --oneline -1
         "
+        ;;
+
+    fix-sandbox)
+        require_docker
+        sdk_container="flatcar-sdk-all-${SDK_VERSION}_os-${OS_VERSION}"
+        docker inspect "${sdk_container}" >/dev/null 2>&1 \
+            || die "SDK container '${sdk_container}' does not exist yet; run 'flatcar-dev sdk' once first."
+        docker start "${sdk_container}" >/dev/null
+        info "Rebuilding sys-apps/sandbox from coreos-overlay in ${sdk_container}"
+        # Executed directly against the SDK container: sdk_entry.sh forces an
+        # interactive login shell, which needs a TTY we may not have here.
+        # sandbox is disabled for its own build, as upstream recommends.
+        docker exec -i -u sdk "${sdk_container}" bash -lc '
+            set -e
+            sudo FEATURES="-sandbox -usersandbox" emerge -1q sys-apps/sandbox::coreos-overlay
+            grep -q "disabling trace-based sandboxing" /usr/lib64/libsandbox.so \
+                || { echo "patch marker missing from libsandbox.so" >&2; exit 1; }
+        '
+        info "OK: patched sandbox installed in ${sdk_container}"
         ;;
 
     fetch-upstream)

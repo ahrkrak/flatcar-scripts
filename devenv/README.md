@@ -58,6 +58,7 @@ tree. Build artifacts stay in the volume and never touch your Mac's disk.
 ./devenv/flatcar-dev shell       # shell in the build tree, inside the VM
 ./devenv/flatcar-dev sdk         # interactive Flatcar SDK shell
 ./devenv/flatcar-dev sync        # push current Mac branch into the build tree
+./devenv/flatcar-dev fix-sandbox # rebuild patched sandbox in the SDK container
 ./devenv/flatcar-dev fetch-upstream
 ./devenv/flatcar-dev down        # stop dev shell (build tree preserved)
 ./devenv/flatcar-dev destroy     # also delete the build tree volume
@@ -92,6 +93,60 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   https://ghcr.io/v2/flatcar/flatcar-sdk-all/tags/list | jq -r '.tags[]' | sort -V | tail
 ```
 
+## Carried patch: sandbox under Rosetta
+
+The amd64 SDK container runs under Apple Rosetta on this machine. Rosetta lets
+the `ptrace()` attach sequence succeed but cannot expose x86_64 registers:
+`PTRACE_GETREGS` fails with `EIO` and never writes the caller's buffer.
+
+`sys-apps/sandbox` only uses ptrace for **static** ELFs (it normally works via
+`LD_PRELOAD`), and it does not check the return value of `trace_get_regs()`. It
+therefore reads uninitialized memory and kills the build with:
+
+```
+libsandbox/trace/linux/x86_64.c:pers_is_32():36: failure (Input/output error):
+unknown x86_64 (CS) personality
+```
+
+In practice this means **every Go package fails to build** (Go emits static
+binaries) while ordinary C packages are unaffected.
+
+We carry a downstream fix in
+`sdk_container/src/third_party/coreos-overlay/sys-apps/sandbox/`. It adds a
+cached probe to the x86_64 `_trace_possible()` hook: when the register file is
+unreadable, tracing is reported as impossible and libsandbox falls back to its
+existing "Unable to trace static ELF" path. `LD_PRELOAD` sandboxing is
+untouched, so only static binaries lose sandbox coverage instead of the build
+aborting. Expect paired QA notices per static exec — that is the fix working:
+
+```
+* ptrace(PTRACE_GETREGS) is not usable (Input/output error); disabling trace-based sandboxing
+* Unable to trace static ELF: /usr/bin/go: go env GOOS
+```
+
+That package is the only one in `coreos-overlay` shadowing `portage-stable`
+(which is an unmodified Gentoo mirror and must not be patched directly). When
+sandbox is bumped upstream, re-copy the ebuild and refresh the patch — or drop
+the package entirely if the fix is accepted upstream.
+
+### Applying it
+
+The SDK's sandbox lives in the **SDK container's** filesystem, not in the build
+tree, so it must be rebuilt once per SDK container:
+
+```bash
+./devenv/flatcar-dev sdk          # create the SDK container (first time only)
+./devenv/flatcar-dev fix-sandbox  # rebuild sandbox from coreos-overlay
+```
+
+Re-run `fix-sandbox` after anything that recreates the SDK container (a new
+`FLATCAR_SDK_VERSION`, or `docker rm` of the container). It is idempotent and
+verifies the patch is present in the installed `libsandbox.so`.
+
+Note this removes the *blocker*, not the *slowness*: Go packages still compile
+under emulation and a full `build_packages` takes many hours. A native x86_64
+Linux host remains the practical answer for full builds.
+
 ## Staying current with upstream
 
 ```bash
@@ -104,7 +159,9 @@ git push origin main
 ## Resource notes
 
 Full `build_packages` runs are long and disk-hungry, and slower still under
-emulation. Docker Desktop is currently allocated ~7.7 GiB of RAM; raise it (and
-CPU count) in Docker Desktop → Settings → Resources before attempting a full
-image build. If full builds become a bottleneck, the same tree and commands work
-unchanged on a native x86_64 Linux host.
+emulation. Docker Desktop is allocated 64 GiB of RAM on this machine; if you
+move to another host, raise memory (and CPU count) in Docker Desktop →
+Settings → Resources before attempting a full image build — the default
+allocation gets builds SIGKILLed (exit 137). If full builds become a
+bottleneck, the same tree and commands work unchanged on a native x86_64 Linux
+host.
