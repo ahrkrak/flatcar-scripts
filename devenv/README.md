@@ -67,9 +67,67 @@ tree. Build artifacts stay in the volume and never touch your Mac's disk.
 Running a build non-interactively:
 
 ```bash
-./devenv/flatcar-dev sdk -- ./build_packages --board=amd64-usr
-./devenv/flatcar-dev sdk -- ./build_image --board=amd64-usr prod
+./devenv/flatcar-dev run -- ./build_packages --board=amd64-usr
+./devenv/flatcar-dev run -- ./build_image --board=amd64-usr prod oem_sysext
 ```
+
+### Long builds: use `run`, not `sdk --`
+
+`flatcar-dev run` wraps the command in `devenv/sdk-run.sh`, which executes it
+*inside* the SDK container and writes the log there. Use it for anything that
+takes more than a few minutes. It exists because of two sharp edges:
+
+**1. `run_sdk_container -- ...` does not accept shell syntax.**
+`sdk_lib/sdk_entry.sh` builds the command line by quoting every argument
+individually:
+
+```sh
+for arg in "$@"; do echo -n "\"$arg\" " >>"$cmd"; done
+```
+
+so a pipeline like `./build_image ... | tee log` arrives as one quoted word and
+bash reports `No such file or directory`. Only a command plus plain arguments
+survive. Keeping the plumbing in a script file avoids the problem.
+
+**2. A `docker exec` stream can drop without killing the build.**
+It is a hijacked HTTP connection through Docker's API proxy. If the client goes
+away — Docker Desktop revalidating itself, the laptop sleeping, a closed
+terminal — the CLI exits **0** and you land back at a prompt, while the build
+carries on inside the container. A host-side `| tee` is then truncated
+mid-line, with no summary and no exit status. This has happened here: a
+`build_packages` run appeared to "return to the command line" ~8 minutes before
+it actually finished, successfully.
+
+`sdk-run.sh` writes the log inside the container instead, so a disconnect
+cannot lose it, and records the build's real exit code:
+
+```
+=== exit=0 at 2026-08-26T10:41:26-00:00 ===
+```
+
+Note that code is captured via `PIPESTATUS[0]`, not `tee`'s status — a plain
+`cmd | tee log` pipeline always reports success regardless of how `cmd` fared.
+
+Logs are named after the command (`build_image` → `image.log`) and land in the
+tree root. Follow one live, or after reconnecting:
+
+```bash
+./devenv/flatcar-dev log image      # tail -f image.log
+./devenv/flatcar-dev log packages
+```
+
+Both the copied runner and the logs are gitignored, so the build tree stays
+clean.
+
+If the terminal does drop, the build is still running. Check with:
+
+```bash
+docker exec -i -u sdk flatcar-sdk-all-4790.0.0_os-4790.0.0 \
+    bash -lc 'ps -eo args | grep "[b]uild_"'
+```
+
+Do **not** start a second build in the meantime — concurrent runs will collide
+over the same board root.
 
 ### Version pinning
 

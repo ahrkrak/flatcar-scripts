@@ -119,6 +119,13 @@ flatcar-dev - Flatcar build environment driver for macOS
   sdk [args...]    Run ./run_sdk_container in the build tree.
                    With no args: interactive SDK shell.
                    Example: flatcar-dev sdk -t -- ./build_packages --board=amd64-usr
+  run -- cmd...    Run a build command in the SDK via devenv/sdk-run.sh, so the
+                   log and exit status are written inside the container and
+                   survive a client disconnect. Prefer this for long builds.
+                   Example: flatcar-dev run -- ./build_image --board=amd64-usr \
+                            prod oem_sysext
+  log [name]       Follow a log written by 'run' (default: image).
+                   Example: flatcar-dev log packages
   sync [ref]       Fetch the current (or given) branch from the Mac clone into
                    the build tree and check it out as 'devwork'.
   fix-sandbox      Rebuild sys-apps/sandbox in the SDK container from
@@ -159,6 +166,30 @@ case "${cmd}" in
         else
             in_shell_tty ./run_sdk_container -t -V "${SDK_VERSION}" -v "${OS_VERSION}" "$@"
         fi
+        ;;
+
+    run)
+        ensure_up
+        [[ "${1:-}" == "--" ]] && shift || true
+        [[ $# -gt 0 ]] || die "run: no command given (try: flatcar-dev run -- ./build_image --board=amd64-usr prod oem_sysext)"
+        # Copy the runner in from the Mac clone on every invocation, so the
+        # tracked version in devenv/ is always the one that executes.
+        in_shell bash -lc "
+            set -e
+            cp /host/scripts/devenv/sdk-run.sh '${TREE}/sdk-run.sh'
+            chmod 755 '${TREE}/sdk-run.sh'
+        "
+        info "Running in SDK: $*"
+        logname="$(basename "${1#./}")"; logname="${logname#build_}"
+        info "Log: ${TREE}/${logname}.log  (follow with: flatcar-dev log ${logname})"
+        in_shell_tty ./run_sdk_container -t -V "${SDK_VERSION}" -v "${OS_VERSION}" \
+            -- ./sdk-run.sh "$@"
+        ;;
+
+    log)
+        ensure_up
+        name="${1:-image}"
+        in_shell_tty tail -f "${TREE}/${name}.log"
         ;;
 
     sync)

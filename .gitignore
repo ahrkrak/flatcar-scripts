@@ -21,3 +21,8 @@ ci-cleanup.sh
 __build__/
 sdk_container/.cache
 sdk_container/.config
+
+# devenv: runner copied into the tree root by 'flatcar-dev run', plus the
+# build logs it writes there (see devenv/README.md)
+/sdk-run.sh
+/*.log
